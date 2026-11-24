@@ -19,8 +19,9 @@ The platform writes `config/lineageos.json`:
 ```
 
 `./build.sh prepare` holds an exclusive lock on `.openfactory-preparing` in the
-cache for its whole run (the platform admits no build meanwhile) and refuses if
-less than 300 GiB is free. It runs
+cache for its whole run (the platform admits no build meanwhile), unless
+`OPENFACTORY_PREPARE_LOCK_HELD=1` says OpenFactory's host prepare loop already
+holds it across every Pixel, and refuses if less than 300 GiB is free. It runs
 `repo init -b <manifest_commit>`, checks that the commit is on the branch,
 syncs, runs `breakfast <device> user` and extracts the vendor files from the
 Google factory image that LineageOS pins (URL and SHA-256) in

@@ -174,6 +174,31 @@ def signing_args(target_files):
     return args
 
 
+@contextlib.contextmanager
+def prepare_marker(cache):
+    """Lock `.openfactory-preparing` for one prepare; the platform queues Pixel builds meanwhile.
+
+    So none waits out its slot on the cache lock. The kernel drops the lock with
+    this process however it ends; the pid is only for operators. The host's
+    prepare loop (OpenFactory `scripts/grapheneos-host.py`) holds it across
+    every Pixel and sets OPENFACTORY_PREPARE_LOCK_HELD=1; locking it again here
+    would wait for that loop forever.
+    """
+    if os.environ.get('OPENFACTORY_PREPARE_LOCK_HELD') == '1':
+        yield
+        return
+    marker = cache / '.openfactory-preparing'
+    with marker.open('w') as held:
+        os.fchmod(held.fileno(), 0o644)  # the platform's API account opens it read-only
+        fcntl.flock(held, fcntl.LOCK_EX)
+        held.write(f'{os.getpid()}\n')
+        held.flush()
+        try:
+            yield
+        finally:
+            marker.unlink(missing_ok=True)
+
+
 class Builder:
     def __init__(self, config, cache):
         self.config, self.cache = config, cache
@@ -235,28 +260,15 @@ class Builder:
         give_to_builder(self.tree, only_if_needed=True)
 
     def prepare(self):
-        """Sync, extract vendor files and compile once per (manifest commit, device): hours under the cache lock.
-
-        The platform admits no build while `.openfactory-preparing` is locked,
-        so none waits out its slot on the cache lock. The kernel drops the lock
-        with this process however it ends; the pid is only for operators.
-        """
-        marker = self.cache / '.openfactory-preparing'
-        with marker.open('w') as held:
-            os.fchmod(held.fileno(), 0o644)  # the platform's API account opens it read-only
-            fcntl.flock(held, fcntl.LOCK_EX)
-            held.write(f'{os.getpid()}\n')
-            held.flush()
-            try:
-                self.prepare_cache()
-                if self.compiled():
-                    return
-                require_free_space(self.cache, self.tree / 'out')
-                self.ensure_source()
-                self.ensure_vendor()
-                self.ensure_compiled()
-            finally:
-                marker.unlink(missing_ok=True)
+        """Sync, extract vendor files and compile once per (manifest commit, device): hours under the cache lock."""
+        with prepare_marker(self.cache):
+            self.prepare_cache()
+            if self.compiled():
+                return
+            require_free_space(self.cache, self.tree / 'out')
+            self.ensure_source()
+            self.ensure_vendor()
+            self.ensure_compiled()
 
     def ensure_source(self):
         marker = self.tree / '.openfactory-manifest'

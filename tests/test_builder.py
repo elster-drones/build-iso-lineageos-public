@@ -235,6 +235,19 @@ class PrepareTests(unittest.TestCase):
             self.prepare(directory)
             self.assertFalse(marker.exists())
 
+    def test_prepare_leaves_the_marker_to_a_host_loop_that_holds_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'cache/.openfactory-preparing'
+            (Path(directory) / 'cache').mkdir()
+            with marker.open('w') as host:
+                host.write('4242\n')
+                host.flush()
+                fcntl.flock(host, fcntl.LOCK_EX)
+                with patch.dict(os.environ, {'OPENFACTORY_PREPARE_LOCK_HELD': '1'}):
+                    self.assertEqual(self.prepare(directory), ['sync', 'vendor', 'compile'])
+                # Neither relocked (which would wait forever), rewritten nor removed.
+                self.assertEqual(marker.read_text(), '4242\n')
+
     def test_waits_for_another_android_compile_instead_of_refusing(self):
         with tempfile.TemporaryDirectory() as directory:
             output, result = io.StringIO(), {}
