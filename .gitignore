@@ -1,0 +1,9 @@
+.cache/
+output/
+__pycache__/
+config/lineageos.json
+keys/*/
+*.pk8
+*.pem
+*.gpg
+id_ed25519*
