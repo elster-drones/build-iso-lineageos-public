@@ -12,6 +12,7 @@ The compiled target files depend only on (manifest commit, device), so
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -26,6 +27,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
 MANIFEST_URL = 'https://github.com/LineageOS/android.git'
@@ -37,6 +39,9 @@ MIN_FREE_BYTES = 300 * 1024**3
 KEY_SUBJECT = '/CN=OpenFactory LineageOS build/'
 # The names `sign_target_files_apks -d` maps to the key directory (testkey and devkey map to releasekey).
 DEFAULT_KEYS = ('releasekey', 'platform', 'shared', 'media', 'networkstack', 'sdk_sandbox', 'bluetooth')
+# Source-tree certificates -d leaves alone. --key_mapping (-k) moves *_mac_permissions.xml with
+# the APK, so NfcNciApex (com.android.nfcservices, security/nfc) keeps its SELinux domain.
+EXTRA_KEYS = ('nfc',)
 AVB_ALGORITHM = 'SHA256_RSA4096'
 # LineageOS's install guide flashes these from the bootloader, the last one as recovery
 # (lineage_wiki _data/devices/frankel.yml: before_recovery_install, recovery_partition_name).
@@ -141,8 +146,8 @@ def signing_args(target_files):
         apks = entries(archive.read('META/apkcerts.txt').decode())
         apexes = entries(archive.read('META/apexkeys.txt').decode())
     devkeys = os.path.dirname(misc.get('default_system_dev_certificate', 'build/make/target/product/security/testkey'))
-    mapped = {f'{devkeys}/{name}.x509.pem' for name in (*DEFAULT_KEYS, 'testkey', 'devkey')}
-    args = []
+    mapped = {f'{devkeys}/{name}.x509.pem' for name in (*DEFAULT_KEYS, *EXTRA_KEYS, 'testkey', 'devkey')}
+    args = [arg for name in EXTRA_KEYS for arg in ('--key_mapping', f'{devkeys}/{name}=keys/{name}')]
     for apk in apks:
         if apk.get('certificate') not in {None, '', 'PRESIGNED', 'EXTERNAL', *mapped}:
             args += ['--extra_apks', f'{checked(apk["name"])}=keys/releasekey']
@@ -222,11 +227,10 @@ class Builder:
         self.prepare_cache()
         if self.compiled():
             return
-        with compile_lock():
-            require_free_space(self.cache)
-            self.ensure_source()
-            self.ensure_vendor()
-            self.ensure_compiled()
+        require_free_space(self.cache)
+        self.ensure_source()
+        self.ensure_vendor()
+        self.ensure_compiled()
 
     def ensure_source(self):
         marker = self.tree / '.openfactory-manifest'
@@ -237,6 +241,8 @@ git config --global user.name >/dev/null || git config --global user.name OpenFa
 git config --global user.email >/dev/null || git config --global user.email builds@openfactory.tech
 git config --global color.ui false
 git lfs install
+# Output of an earlier commit; a retry of the same commit keeps it and builds incrementally.
+rm -rf out
 repo init -u "$MANIFEST_URL" -b "$COMMIT" --git-lfs --no-clone-bundle
 git -C .repo/manifests fetch -q origin "refs/heads/$BRANCH"
 git -C .repo/manifests merge-base --is-ancestor "$COMMIT" FETCH_HEAD
@@ -271,26 +277,29 @@ printf '%s\\n' "$COMMIT" > ".openfactory-vendor-$DEVICE"
     def ensure_compiled(self):
         if self.compiled():
             return
-        require_free_space(self.cache)
         target_files, otatools, source_manifest = self.release_files()
-        self.step('compile', '''
-rm -rf out
+        with compile_lock():
+            require_free_space(self.cache)
+            self.step('compile', '''
 set +u
 source build/envsetup.sh >/dev/null
 breakfast "$DEVICE" user
 m ${LINEAGEOS_JOBS:+-j$LINEAGEOS_JOBS} target-files-package otatools-package
 set -u
-built=("$OUT"/obj/PACKAGING/target_files_intermediates/*-target_files*.zip)
-test "${#built[@]}" -eq 1 && test -f "${built[0]}"
+# Soong installs the otatools-package genrule here, not in $OUT (GrapheneOS script/finalize.sh).
+built_otatools="$ANDROID_HOST_OUT/obj/ETC/otatools-packagelinux_glibc_x86_64_intermediates/otatools-packagelinux_glibc_x86_64"
+built_target_files="$OUT/obj/PACKAGING/target_files_intermediates/$TARGET_PRODUCT-target_files.zip"
+test -f "$built_target_files"
+test -f "$built_otatools"
 mkdir -p "$(dirname "$TARGET_FILES")"
-cp "${built[0]}" "$TARGET_FILES"
-cp "$OUT/otatools.zip" "$OTATOOLS"
+cp "$built_target_files" "$TARGET_FILES"
+cp "$built_otatools" "$OTATOOLS"
 # The manifest pins branches; record the exact project revisions this compile used.
 repo manifest -r -o "$SOURCE_MANIFEST"
 rm -rf out
 printf '%s\\n' "$COMMIT" > ".openfactory-compiled-$DEVICE"
 ''', variables={'DEVICE': self.device, 'COMMIT': self.commit, 'TARGET_FILES': target_files,
-            'OTATOOLS': otatools, 'SOURCE_MANIFEST': source_manifest})
+                'OTATOOLS': otatools, 'SOURCE_MANIFEST': source_manifest})
 
     def ensure_keys(self, keys, password):
         if (keys / 'avb_pkmd.bin').is_file():
@@ -308,7 +317,8 @@ cd "$work"
 for key in $DEFAULT_KEYS; do
     # make_key always exits 1 through its EXIT trap; judge it by its outputs.
     printf '\\n' | "$TREE/development/tools/make_key" "$key" "$SUBJECT" >/dev/null || true
-    test -s "$key.pk8" && test -s "$key.x509.pem"
+    test -s "$key.pk8"
+    test -s "$key.x509.pem"
     openssl pkcs8 -topk8 -inform DER -in "$key.pk8" -outform DER -out "$KEYS/$key.pk8" -passout env:password -scrypt
     cp "$key.x509.pem" "$KEYS/"
 done
@@ -316,7 +326,7 @@ openssl genrsa 4096 2>/dev/null | openssl pkcs8 -topk8 -nocrypt -out avb.pem
 openssl pkcs8 -topk8 -in avb.pem -out "$KEYS/avb.pem" -passout env:password -scrypt
 python3 "$TREE/external/avb/avbtool.py" extract_public_key --key avb.pem --output "$KEYS/avb_pkmd.bin"
 ''', cwd=keys, stdin=password + '\n', variables={'TREE': self.tree, 'KEYS': keys, 'SUBJECT': KEY_SUBJECT,
-            'DEFAULT_KEYS': ' '.join(DEFAULT_KEYS)})
+            'DEFAULT_KEYS': ' '.join((*DEFAULT_KEYS, *EXTRA_KEYS))})
 
     def sign(self, keys, password):
         """LineageOS signing guide: sign_target_files_apks, then ota_from_target_files; images for flashing."""
@@ -344,7 +354,7 @@ read -ra sign_args <<< "$SIGN_ARGS"
 sign_target_files_apks -o -d keys "${sign_args[@]}" "$TARGET_FILES" signed-target_files.zip
 ota_from_target_files -k keys/releasekey --block --backup=true signed-target_files.zip "$DEVICE-ota_update.zip"
 img_from_target_files signed-target_files.zip "$DEVICE-img.zip"
-rm -f keys signed-target_files.zip
+rm -f keys
 ''', cwd=self.work, stdin=password + '\n', variables={'TREE': self.tree, 'KEYS': keys, 'DEVICE': self.device,
             'TARGET_FILES': target_files, 'OTATOOLS': otatools, 'SIGN_ARGS': ' '.join(signing_args(target_files))})
         return self.work
@@ -368,6 +378,42 @@ python3 "$TREE/external/avb/avbtool.py" info_image --image vbmeta.img > vbmeta-i
         missing = [name for name in FLASHED_IMAGES if not (images / f'{name}.img').is_file()]
         if missing:
             raise ValueError(f'Signed images lack {", ".join(missing)}')
+        check_mac_permissions(work / 'signed-target_files.zip', keys,
+            sorted((self.tree / 'build/make/target/product/security').glob('*.x509.pem')))
+
+
+def certificate_hex(path):
+    """An X.509 PEM certificate as the lowercase DER hex mac_permissions.xml signers use."""
+    body = re.search(r'-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----', Path(path).read_text(), re.S)
+    if not body:
+        raise ValueError(f'No certificate in {path}')
+    return base64.b64decode(''.join(body.group(1).split())).hex()
+
+
+def check_mac_permissions(signed_target_files, keys, test_certificates):
+    """No SELinux signer may still name a public source-tree test certificate.
+
+    Pixel policy also trusts Google's own certificates for presigned vendor apps
+    (device/google/laguna sepolicy/certificates), so those may remain.
+    """
+    public = {certificate_hex(path): Path(path).name for path in test_certificates}
+    if not public:
+        raise ValueError('No source-tree test certificates to check mac_permissions.xml against')
+    owner_platform = certificate_hex(keys / 'platform.x509.pem')
+    trusted = set()
+    with zipfile.ZipFile(signed_target_files) as archive:
+        policies = [name for name in archive.namelist() if name.endswith('mac_permissions.xml')]
+        if not policies:
+            raise ValueError('The signed target files carry no mac_permissions.xml')
+        for name in policies:
+            signers = {signer.get('signature', '').lower()
+                for signer in ElementTree.fromstring(archive.read(name)).iter('signer')}
+            left = sorted(public[signer] for signer in signers & public.keys())
+            if left:
+                raise ValueError(f'{name} still trusts the source-tree test certificate {", ".join(left)}')
+            trusted |= signers
+    if owner_platform not in trusted:
+        raise ValueError("No mac_permissions.xml trusts the owner's platform certificate")
 
 
 def ota_name(config):
@@ -404,11 +450,10 @@ First install (this erases the phone):
 5. Leave the bootloader unlocked. Like official LineageOS builds, this build does
    not enforce verified boot, so a relocked phone would refuse to start it.
 
-Updates: official LineageOS updates are signed with LineageOS's keys and cannot be
-installed over this build. Build the next update in OpenFactory with the same
-account and phone model, then sideload it from recovery with `adb -d sideload`.
-A build signed with other keys cannot be installed over this one without erasing
-the phone.
+Updates: build the next update in OpenFactory with the same account and phone
+model, then sideload it from recovery with `adb -d sideload`. Recovery also accepts
+official LineageOS updates; installing one over this build changes the signing
+keys and requires wiping the phone, as does any build signed with other keys.
 '''
 
 

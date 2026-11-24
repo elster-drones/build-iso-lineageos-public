@@ -1,3 +1,4 @@
+import base64
 import collections
 import contextlib
 import fcntl
@@ -23,21 +24,46 @@ GOOD = {'schema_version': 1, 'device': 'frankel', 'model': 'Pixel 10', 'branch':
 PASSWORD = 'p' * 40
 OWNER_SHA1 = hashlib.sha1(b'owner-avb-key').hexdigest()
 Usage = collections.namedtuple('Usage', 'total used free')
+# DER stand-ins: public source-tree test certificates, the owner's, and Google's (Pixel vendor policy).
+TEST_CERTS = {'platform': b'aosp-platform', 'nfc': b'aosp-nfc', 'testkey': b'aosp-testkey'}
+OWNER_PLATFORM, OWNER_NFC, GOOGLE = b'owner-platform', b'owner-nfc', b'google-apps'
 
 
 class FakeAccount:
     pw_uid, pw_gid = 990, 990
 
 
+def pem(der):
+    return f'-----BEGIN CERTIFICATE-----\n{base64.b64encode(der).decode()}\n-----END CERTIFICATE-----\n'
+
+
+def policy(*signers):
+    return ('<?xml version="1.0" encoding="utf-8"?>\n<policy>\n' + ''.join(
+        f'  <signer signature="{der.hex()}">\n    <seinfo value="app"/>\n  </signer>\n' for der in signers)
+        + '</policy>\n')
+
+
 def write_keys(keys):
     keys.mkdir(parents=True)
     (keys / 'avb_pkmd.bin').write_bytes(b'owner-avb-key')
     (keys / 'releasekey.x509.pem').write_bytes(b'release-cert')
+    (keys / 'platform.x509.pem').write_text(pem(OWNER_PLATFORM))
 
 
-def write_signed(work, device='frankel', *, otacert=b'release-cert', images=builder.FLASHED_IMAGES):
-    """What the sign step leaves behind: the OTA package and img_from_target_files output."""
+def write_test_certs(tree):
+    security = tree / 'build/make/target/product/security'
+    security.mkdir(parents=True)
+    for name, der in TEST_CERTS.items():
+        (security / f'{name}.x509.pem').write_text(pem(der))
+
+
+def write_signed(work, device='frankel', *, otacert=b'release-cert', images=builder.FLASHED_IMAGES,
+                 platform_policy=(OWNER_PLATFORM, OWNER_NFC)):
+    """What the sign step leaves behind: signed target files, the OTA package and img_from_target_files output."""
     work.mkdir(parents=True)
+    with zipfile.ZipFile(work / 'signed-target_files.zip', 'w') as archive:
+        archive.writestr('SYSTEM/etc/selinux/plat_mac_permissions.xml', policy(*platform_policy))
+        archive.writestr('VENDOR/etc/selinux/vendor_mac_permissions.xml', policy(GOOGLE))
     with zipfile.ZipFile(work / f'{device}-ota_update.zip', 'w') as archive:
         archive.writestr('META-INF/com/android/otacert', otacert)
         archive.writestr('payload.bin', b'payload')
@@ -135,12 +161,13 @@ class PrivilegeTests(unittest.TestCase):
 
 
 class PrepareTests(unittest.TestCase):
-    def prepare(self, directory, *, free=builder.MIN_FREE_BYTES, run=None):
+    def prepare(self, directory, *, free=(builder.MIN_FREE_BYTES,) * 2, run=None, step=None):
+        """Run prepare with fake steps; `free` is what each free-space check sees, in order."""
         run = run or builder.Builder(GOOD, Path(directory) / 'cache')
         self.steps = []
         with patch.object(builder, 'COMPILE_LOCK', Path(directory) / '.android-compile.lock'), \
-                patch.object(builder.shutil, 'disk_usage', return_value=Usage(0, 0, free)), \
-                patch.object(run, 'step', lambda name, *a, **k: self.steps.append(name)):
+                patch.object(builder.shutil, 'disk_usage', side_effect=[Usage(0, 0, value) for value in free]), \
+                patch.object(run, 'step', step or (lambda name, *a, **k: self.steps.append(name))):
             run.prepare()
         return self.steps
 
@@ -161,22 +188,39 @@ class PrepareTests(unittest.TestCase):
             self.assertEqual(self.prepare(directory, run=bumped), ['sync', 'vendor', 'compile'])
             self.assertFalse((old.releases / GOOD['manifest_commit']).exists())
 
-    def test_refuses_to_compile_below_300_gib_free(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(SystemExit) as refused:
-                self.prepare(directory, free=builder.MIN_FREE_BYTES - 1)
-            self.assertIn('300 GiB needed', str(refused.exception))
-            self.assertEqual(self.steps, [])
+    def test_refuses_below_300_gib_free_before_syncing_and_before_compiling(self):
+        for free, ran in [((builder.MIN_FREE_BYTES - 1,), []),
+                          ((builder.MIN_FREE_BYTES, builder.MIN_FREE_BYTES - 1), ['sync', 'vendor'])]:
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(SystemExit) as refused:
+                    self.prepare(directory, free=free)
+                self.assertIn('300 GiB needed', str(refused.exception))
+                self.assertEqual(self.steps, ran)
 
-    def test_refuses_while_another_android_compile_holds_the_host_lock(self):
+    def test_refuses_to_compile_while_another_android_compile_holds_the_host_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             with (Path(directory) / '.android-compile.lock').open('a') as held:
                 fcntl.flock(held, fcntl.LOCK_EX)
                 with self.assertRaises(SystemExit) as refused:
                     self.prepare(directory)
             self.assertIn('another Android compile', str(refused.exception))
-            self.assertEqual(self.steps, [])
+            self.assertEqual(self.steps, ['sync', 'vendor'])
             self.assertEqual(self.prepare(directory), ['sync', 'vendor', 'compile'])
+
+    def test_only_the_compile_holds_the_host_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            held = {}
+
+            def step(name, *args, **kwargs):
+                with (Path(directory) / '.android-compile.lock').open('a') as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        held[name] = False
+                    except BlockingIOError:
+                        held[name] = True
+
+            self.prepare(directory, step=step)
+            self.assertEqual(held, {'sync': False, 'vendor': False, 'compile': True})
 
     def test_a_build_run_refuses_when_the_commit_is_not_compiled(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -210,6 +254,7 @@ class SigningArgsTests(unittest.TestCase):
                     f'name="Browser.apk" certificate="{security}/testkey.x509.pem" private_key="{security}/testkey.pk8"',
                     'name="ServiceWifiResources.apk" certificate="packages/modules/Wifi/resources.x509.pem" '
                     'private_key="packages/modules/Wifi/resources.pk8" partition="system"',
+                    f'name="NfcNciApex.apk" certificate="{security}/nfc.x509.pem" private_key="{security}/nfc.pk8"',
                     'name="Camera.apk" certificate="PRESIGNED" private_key=""', '']))
                 archive.writestr('META/apexkeys.txt', '\n'.join([
                     'name="com.android.adbd.apex" public_key="a.avbpubkey" private_key="a.pem" '
@@ -218,6 +263,8 @@ class SigningArgsTests(unittest.TestCase):
                     'container_certificate="PRESIGNED" container_private_key="PRESIGNED" partition="vendor"']))
             args = builder.signing_args(target_files)
         pairs = list(zip(args[::2], args[1::2]))
+        # The nfc certificate is remapped, not overridden per APK, so mac_permissions.xml follows it.
+        self.assertEqual([value for flag, value in pairs if flag == '--key_mapping'], [f'{security}/nfc=keys/nfc'])
         self.assertEqual([value for flag, value in pairs if flag == '--extra_apks'],
             ['ServiceWifiResources.apk=keys/releasekey', 'com.android.adbd.apex=keys/releasekey'])
         self.assertEqual([value for flag, value in pairs if flag == '--extra_apex_payload_key'],
@@ -244,6 +291,7 @@ class VerifyAndPackageTests(unittest.TestCase):
         run = builder.Builder(GOOD, Path(directory))
         keys = Path(directory) / 'keys'
         write_keys(keys)
+        write_test_certs(run.tree)
         write_signed(run.work, **signed)
 
         def step(name, script, *, cwd=None, **kwargs):
@@ -261,6 +309,14 @@ class VerifyAndPackageTests(unittest.TestCase):
                 {'images': ('boot', 'dtbo', 'vendor_kernel_boot')}]:
             with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
                 self.verify(directory, **change)
+
+    def test_rejects_selinux_policy_left_on_test_certificates(self):
+        for platform_policy, message in [((OWNER_PLATFORM, TEST_CERTS['nfc']), 'nfc.x509.pem'),
+                                         ((TEST_CERTS['platform'], OWNER_NFC), 'platform.x509.pem'),
+                                         ((OWNER_NFC,), "owner's platform certificate")]:
+            with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError) as refused:
+                self.verify(directory, platform_policy=platform_policy)
+            self.assertIn(message, str(refused.exception))
 
     def test_package_covers_every_member_and_never_private_keys(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -306,7 +362,9 @@ class VerifyAndPackageTests(unittest.TestCase):
                 'not affiliated with the LineageOS project',
                 'Flashing, radios and updates must be tested on the phone',
                 'fastboot flash vendor_boot images/vendor_boot.img',
-                'adb -d sideload images/lineage-24.0-frankel-ota.zip', GOOD['manifest_commit']]:
+                'adb -d sideload images/lineage-24.0-frankel-ota.zip', GOOD['manifest_commit'],
+                'Recovery also accepts official LineageOS updates',
+                'changes the signing keys and requires wiping the phone']:
             self.assertIn(phrase, notes)
 
     def test_gitignore_keeps_keys_and_outputs_out_of_build_branches(self):
