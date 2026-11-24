@@ -23,6 +23,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -33,8 +34,6 @@ ROOT = Path(__file__).resolve().parent
 MANIFEST_URL = 'https://github.com/LineageOS/android.git'
 BRANCH = 'lineage-24.0'
 BUILD_USER = os.environ.get('LINEAGEOS_BUILD_USER', 'of-lineageos')
-# One host-wide lock: LineageOS and GrapheneOS compiles take turns on the build disk.
-COMPILE_LOCK = Path('/var/cache/goldengoose/.android-compile.lock')
 MIN_FREE_BYTES = 300 * 1024**3
 KEY_SUBJECT = '/CN=OpenFactory LineageOS build/'
 # The names `sign_target_files_apks -d` maps to the key directory (testkey and devkey map to releasekey).
@@ -108,15 +107,25 @@ def give_to_builder(*paths, only_if_needed=False):
 
 
 @contextlib.contextmanager
-def compile_lock():
-    """Refuse instead of waiting while another Android compile holds the build disk."""
-    with COMPILE_LOCK.open('a') as lock:
+def locked(path, waiting=None):
+    """Hold an exclusive flock on path, refusing a symlink or anything but a regular file there."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'rb') as lock:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError(f'{path} is not a regular file; refusing to lock it')
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise SystemExit(f'Refusing to prepare LineageOS: another Android compile holds {COMPILE_LOCK}. '
-                'Run prepare again when it has finished.') from None
+            if waiting:
+                print(waiting, flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+def compile_lock(cache):
+    """One Android compile at a time on this host; the GrapheneOS cache beside this one shares the lock
+    (/var/cache/goldengoose/.android-compile.lock)."""
+    return locked(cache.parent / '.android-compile.lock', 'Waiting for another Android compile on this host to finish')
 
 
 def require_free_space(path, out):
@@ -226,14 +235,28 @@ class Builder:
         give_to_builder(self.tree, only_if_needed=True)
 
     def prepare(self):
-        """Sync, extract vendor files and compile once per (manifest commit, device)."""
-        self.prepare_cache()
-        if self.compiled():
-            return
-        require_free_space(self.cache, self.tree / 'out')
-        self.ensure_source()
-        self.ensure_vendor()
-        self.ensure_compiled()
+        """Sync, extract vendor files and compile once per (manifest commit, device): hours under the cache lock.
+
+        The platform admits no build while `.openfactory-preparing` is locked,
+        so none waits out its slot on the cache lock. The kernel drops the lock
+        with this process however it ends; the pid is only for operators.
+        """
+        marker = self.cache / '.openfactory-preparing'
+        with marker.open('w') as held:
+            os.fchmod(held.fileno(), 0o644)  # the platform's API account opens it read-only
+            fcntl.flock(held, fcntl.LOCK_EX)
+            held.write(f'{os.getpid()}\n')
+            held.flush()
+            try:
+                self.prepare_cache()
+                if self.compiled():
+                    return
+                require_free_space(self.cache, self.tree / 'out')
+                self.ensure_source()
+                self.ensure_vendor()
+                self.ensure_compiled()
+            finally:
+                marker.unlink(missing_ok=True)
 
     def ensure_source(self):
         marker = self.tree / '.openfactory-manifest'
@@ -281,7 +304,7 @@ printf '%s\\n' "$COMMIT" > ".openfactory-vendor-$DEVICE"
         if self.compiled():
             return
         target_files, otatools, source_manifest = self.release_files()
-        with compile_lock():
+        with compile_lock(self.cache):
             require_free_space(self.cache, self.tree / 'out')
             self.step('compile', '''
 set +u

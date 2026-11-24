@@ -1,6 +1,7 @@
 import base64
 import collections
 import contextlib
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -10,6 +11,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -164,9 +167,9 @@ class PrepareTests(unittest.TestCase):
     def prepare(self, directory, *, free=(builder.MIN_FREE_BYTES,) * 2, run=None, step=None):
         """Run prepare with fake steps; `free` is what each free-space check sees, in order."""
         run = run or builder.Builder(GOOD, Path(directory) / 'cache')
+        run.cache.mkdir(parents=True, exist_ok=True)
         self.steps = []
-        with patch.object(builder, 'COMPILE_LOCK', Path(directory) / '.android-compile.lock'), \
-                patch.object(builder.shutil, 'disk_usage', side_effect=[Usage(0, 0, value) for value in free]), \
+        with patch.object(builder.shutil, 'disk_usage', side_effect=[Usage(0, 0, value) for value in free]), \
                 patch.object(run, 'step', step or (lambda name, *a, **k: self.steps.append(name))):
             run.prepare()
         return self.steps
@@ -210,15 +213,65 @@ class PrepareTests(unittest.TestCase):
             self.assertIn(f"in {run.tree / 'out'} from an earlier compile", str(refused.exception))
             self.assertEqual(self.steps, [])
 
-    def test_refuses_to_compile_while_another_android_compile_holds_the_host_lock(self):
+    def test_prepare_locks_its_marker_until_it_exits(self):
         with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'cache/.openfactory-preparing'
+            seen = []
+
+            def step(name, *args, **kwargs):
+                self.assertEqual(oct(marker.stat().st_mode & 0o777), '0o644')
+                with marker.open() as reader:
+                    with self.assertRaises(BlockingIOError) as blocked:
+                        fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    self.assertEqual(blocked.exception.errno, errno.EWOULDBLOCK)
+                    seen.append(reader.read())
+                if name == 'compile':
+                    raise RuntimeError('LineageOS step compile failed')
+
+            with self.assertRaises(RuntimeError):
+                self.prepare(directory, step=step)
+            self.assertEqual(seen, [f'{os.getpid()}\n'] * 3)
+            self.assertFalse(marker.exists())
+            self.prepare(directory)
+            self.assertFalse(marker.exists())
+
+    def test_waits_for_another_android_compile_instead_of_refusing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, result = io.StringIO(), {}
+
+            def prepare():
+                with contextlib.redirect_stdout(output):
+                    result['steps'] = self.prepare(directory)
+
             with (Path(directory) / '.android-compile.lock').open('a') as held:
                 fcntl.flock(held, fcntl.LOCK_EX)
-                with self.assertRaises(SystemExit) as refused:
-                    self.prepare(directory)
-            self.assertIn('another Android compile', str(refused.exception))
-            self.assertEqual(self.steps, ['sync', 'vendor'])
-            self.assertEqual(self.prepare(directory), ['sync', 'vendor', 'compile'])
+                waiter = threading.Thread(target=prepare)
+                waiter.start()
+                deadline = time.monotonic() + 5
+                while 'Waiting for another Android compile' not in output.getvalue() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                waiter.join(timeout=0.2)
+                self.assertTrue(waiter.is_alive())
+                self.assertEqual(self.steps, ['sync', 'vendor'])
+            waiter.join(timeout=5)
+            self.assertEqual(result, {'steps': ['sync', 'vendor', 'compile']})
+
+    def test_the_host_lock_is_a_private_regular_file_never_a_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache, lock = Path(directory) / 'cache', Path(directory) / '.android-compile.lock'
+            with builder.compile_lock(cache):
+                pass
+            self.assertEqual(oct(lock.stat().st_mode & 0o777), '0o600')
+            lock.unlink()
+            (Path(directory) / 'elsewhere').touch()
+            lock.symlink_to(Path(directory) / 'elsewhere')
+            with self.assertRaises(OSError) as refused, builder.compile_lock(cache):
+                pass
+            self.assertEqual(refused.exception.errno, errno.ELOOP)
+            lock.unlink()
+            os.mkfifo(lock)
+            with self.assertRaises(RuntimeError), builder.compile_lock(cache):
+                pass
 
     def test_only_the_compile_holds_the_host_lock(self):
         with tempfile.TemporaryDirectory() as directory:

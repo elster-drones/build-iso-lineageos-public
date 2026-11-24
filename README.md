@@ -18,14 +18,16 @@ The platform writes `config/lineageos.json`:
  "manifest_commit": "<commit on lineage-24.0>"}
 ```
 
-`./build.sh prepare` refuses if less than 300 GiB is free. It runs
+`./build.sh prepare` holds an exclusive lock on `.openfactory-preparing` in the
+cache for its whole run (the platform admits no build meanwhile) and refuses if
+less than 300 GiB is free. It runs
 `repo init -b <manifest_commit>`, checks that the commit is on the branch,
 syncs, runs `breakfast <device> user` and extracts the vendor files from the
 Google factory image that LineageOS pins (URL and SHA-256) in
 `vendor/lineage/vars/<device>`. For the compile only it takes the host-wide
 `/var/cache/goldengoose/.android-compile.lock` (shared with the GrapheneOS
-adapter, so compiles take turns), refusing if another compile holds it or free
-space has dropped below 300 GiB, and builds `target-files-package` and
+adapter, so compiles take turns; it waits while another compile holds it),
+refuses if free space has then dropped below 300 GiB, and builds `target-files-package` and
 `otatools-package` into `LINEAGEOS_CACHE_DIR/releases/<manifest_commit>/`. A
 failed compile keeps `out/`, so retrying the same commit is incremental; a new
 commit's sync removes it.
