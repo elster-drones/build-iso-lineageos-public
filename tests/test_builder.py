@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -247,6 +248,27 @@ class PrepareTests(unittest.TestCase):
                     self.assertEqual(self.prepare(directory), ['sync', 'vendor', 'compile'])
                 # Neither relocked (which would wait forever), rewritten nor removed.
                 self.assertEqual(marker.read_text(), '4242\n')
+
+    def test_a_hand_run_prepare_refuses_while_a_host_loop_holds_the_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'cache/.openfactory-preparing'
+            marker.parent.mkdir()
+            # Stands in for OpenFactory's host prepare loop: lock the marker, say so, hold it.
+            host = subprocess.Popen([sys.executable, '-c', "import fcntl, os, sys, time\n"
+                "held = open(sys.argv[1], 'a')\nfcntl.flock(held, fcntl.LOCK_EX)\n"
+                "held.write(f'{os.getpid()}\\n'); held.flush()\nprint('locked', flush=True)\ntime.sleep(60)\n",
+                str(marker)], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(host.stdout.readline().strip(), 'locked')
+                with self.assertRaises(SystemExit) as refused:
+                    self.prepare(directory)
+            finally:
+                host.kill()
+                host.wait()
+            self.assertEqual(str(refused.exception.code),
+                'A host prepare loop holds this cache; run this after that loop finishes')
+            self.assertEqual(self.steps, [])
+            self.assertEqual(marker.read_text(), f'{host.pid}\n')  # the loop's pid is left as it was
 
     def test_waits_for_another_android_compile_instead_of_refusing(self):
         with tempfile.TemporaryDirectory() as directory:
