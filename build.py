@@ -119,10 +119,13 @@ def compile_lock():
         yield
 
 
-def require_free_space(path):
+def require_free_space(path, out):
+    """Count a kept out/ as reclaimable: a retry reuses it and a new commit's sync removes it."""
     free = shutil.disk_usage(path).free
-    if free < MIN_FREE_BYTES:
-        raise SystemExit(f'Refusing to prepare LineageOS: {free // 1024**3} GiB free in {path}, '
+    kept = int(subprocess.check_output(['du', '-s', '--block-size=1', str(out)]).split()[0]) if out.is_dir() else 0
+    if free + kept < MIN_FREE_BYTES:
+        held = f' plus {kept // 1024**3} GiB in {out} from an earlier compile' if kept else ''
+        raise SystemExit(f'Refusing to prepare LineageOS: {free // 1024**3} GiB free in {path}{held}, '
             f'{MIN_FREE_BYTES // 1024**3} GiB needed.')
 
 
@@ -227,7 +230,7 @@ class Builder:
         self.prepare_cache()
         if self.compiled():
             return
-        require_free_space(self.cache)
+        require_free_space(self.cache, self.tree / 'out')
         self.ensure_source()
         self.ensure_vendor()
         self.ensure_compiled()
@@ -279,7 +282,7 @@ printf '%s\\n' "$COMMIT" > ".openfactory-vendor-$DEVICE"
             return
         target_files, otatools, source_manifest = self.release_files()
         with compile_lock():
-            require_free_space(self.cache)
+            require_free_space(self.cache, self.tree / 'out')
             self.step('compile', '''
 set +u
 source build/envsetup.sh >/dev/null

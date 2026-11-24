@@ -197,6 +197,19 @@ class PrepareTests(unittest.TestCase):
                 self.assertIn('300 GiB needed', str(refused.exception))
                 self.assertEqual(self.steps, ran)
 
+    def test_a_retry_counts_the_kept_out_directory_as_reclaimable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = builder.Builder(GOOD, Path(directory) / 'cache')
+            (run.tree / 'out').mkdir(parents=True)
+            (run.tree / 'out/build.ninja').write_bytes(os.urandom(64 * 1024))
+            (run.tree / '.openfactory-manifest').write_text(GOOD['manifest_commit'] + '\n')
+            short = builder.MIN_FREE_BYTES - 1024
+            self.assertEqual(self.prepare(directory, run=run, free=(short, short)), ['vendor', 'compile'])
+            with self.assertRaises(SystemExit) as refused:
+                self.prepare(directory, run=run, free=(builder.MIN_FREE_BYTES - 1024**3,))
+            self.assertIn(f"in {run.tree / 'out'} from an earlier compile", str(refused.exception))
+            self.assertEqual(self.steps, [])
+
     def test_refuses_to_compile_while_another_android_compile_holds_the_host_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             with (Path(directory) / '.android-compile.lock').open('a') as held:
